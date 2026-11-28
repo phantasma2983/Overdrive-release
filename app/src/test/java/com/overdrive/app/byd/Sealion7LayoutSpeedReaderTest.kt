@@ -1,7 +1,10 @@
 package com.overdrive.app.byd
 
+import com.overdrive.app.byd.Sealion7LayoutSpeedReader.SelectionAction
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -17,6 +20,38 @@ class Sealion7LayoutSpeedReaderTest {
         assertFalse(Sealion7LayoutSpeedReader.eligible("dilink5", "seal", "user"))
         assertFalse(Sealion7LayoutSpeedReader.eligible("default", "sealion7", "user"))
         assertFalse(Sealion7LayoutSpeedReader.eligible(null, "sealion7", "user"))
+    }
+
+    @Test fun unknownConfigWaitsForOptInAndKeepsAnOpenedAdapterAlive() {
+        val selected = JSONObject("""{"vehicle":{"modelId":"sealion7","modelSource":"user"}}""")
+        val other = JSONObject("""{"vehicle":{"modelId":"seal","modelSource":"user"}}""")
+        for (opened in listOf(false, true)) {
+            fun action(read: () -> JSONObject?) = Sealion7LayoutSpeedReader.selectionAction("dilink5", opened, read)
+            assertEquals(SelectionAction.RECHECK, action { null })
+            assertEquals(SelectionAction.RECHECK, action { throw java.io.IOException("config unavailable") })
+            assertEquals(if (opened) SelectionAction.RECHECK else SelectionAction.OPEN_ADAPTER, action { selected })
+            assertEquals(SelectionAction.STOP, action { other })
+            assertEquals(SelectionAction.STOP, action { JSONObject() })
+        }
+    }
+
+    @Test fun diagnosticsCountTheChosenSourceAndPreserveTheFirstStopReason() {
+        assertNull(reading.stopReason)
+        assertEquals(feed, reading.valueOr(1000, feed), 0.0)
+        val generation = reading.generation()
+        // Identical numeric values still come from different sources.
+        reading.publish(feed, 1000, generation)
+        assertEquals(feed, reading.valueOr(1000, feed), 0.0)
+        assertEquals(feed, reading.valueOr(1000, feed, connected = false), 0.0)
+        assertEquals(feed, reading.valueOr(1501, feed), 0.0)
+        assertTrue(reading.stop("Committed mode changed"))
+        assertFalse(reading.stop("Session closed"))
+        reading.publish(0.0, 1600, generation)
+        assertEquals(feed, reading.valueOr(1600, feed), 0.0)
+
+        assertEquals("Committed mode changed", reading.stopReason)
+        assertEquals(1L, reading.directReadings)
+        assertEquals(4L, reading.feedReadings)
     }
 
     @Test fun usesFreshFractionalSpeedAndAcceptsParkedZero() {

@@ -34,19 +34,53 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
                     app.applicationInfo.uid == Process.myUid()
                 ) {
                     thread.start()
+                } else {
+                    stop("Outside app process")
                 }
             }
         }
 
         internal fun eligible(mode: String?, modelId: Any?, modelSource: Any?): Boolean =
             DiLink5Platform.isSelected(mode, null) && Sealion7HdmiProjection.isUserSelected(modelId, modelSource)
+
+        internal fun selectionAction(mode: String, adapterOpened: Boolean, readConfig: () -> JSONObject?): SelectionAction {
+            val selected = try {
+                val root = readConfig() ?: return SelectionAction.RECHECK
+                val vehicle = root.optJSONObject("vehicle")
+                eligible(mode, vehicle?.opt("modelId"), vehicle?.opt("modelSource"))
+            } catch (_: Exception) {
+                return SelectionAction.RECHECK
+            }
+            return when {
+                !selected -> SelectionAction.STOP
+                adapterOpened -> SelectionAction.RECHECK
+                else -> SelectionAction.OPEN_ADAPTER
+            }
+        }
     }
+
+    internal enum class SelectionAction { OPEN_ADAPTER, RECHECK, STOP }
 
     internal class LatestReading {
         private data class Sample(val kmh: Double, val readStartedAtMs: Long)
 
         private var generation = 0L
         private var sample: Sample? = null
+
+        @Volatile var stopReason: String? = null
+            private set
+        @Volatile var directReadings = 0L
+            private set
+        @Volatile var feedReadings = 0L
+            private set
+
+        @Synchronized
+        fun stop(reason: String): Boolean {
+            if (stopReason != null) return false
+            stopReason = reason
+            clear()
+            return true
+        }
 
         @Synchronized
         fun generation(): Long = generation
@@ -59,17 +93,22 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
 
         @Synchronized
         fun publish(rawKmh: Double, readStartedAtMs: Long, generation: Long) {
-            if (generation != this.generation) return
+            if (stopReason != null || generation != this.generation) return
             // Apply the same raw vehicle speed bounds as the DiLink 5 collector.
             sample = if (rawKmh in 0.0..300.0) Sample(rawKmh, readStartedAtMs) else null
         }
 
         @Synchronized
-        fun valueOr(nowMs: Long, feedSpeedKmh: Double): Double {
-            val current = sample ?: return feedSpeedKmh
+        fun valueOr(nowMs: Long, feedSpeedKmh: Double, connected: Boolean = true): Double {
+            val current = sample
             // The getter has no vehicle timestamp. Expire by call start so a delayed
             // response cannot renew a reading after the freshness window has passed.
-            return if (nowMs - current.readStartedAtMs in 0..MAX_SAMPLE_AGE_MS) current.kmh else feedSpeedKmh
+            if (connected && current != null && nowMs - current.readStartedAtMs in 0..MAX_SAMPLE_AGE_MS) {
+                directReadings++
+                return current.kmh
+            }
+            feedReadings++
+            return feedSpeedKmh
         }
     }
 
@@ -83,7 +122,14 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
     )
 
     private val latest = LatestReading()
-    private val closed = AtomicBoolean(false)
+    /** First terminal reason for this session, or null while the reader is live. */
+    val stopReason: String? get() = latest.stopReason
+
+    /** Render calls resolved with the OEM sample and the normal feed, respectively. */
+    val directReadings: Long get() = latest.directReadings
+    val feedReadings: Long get() = latest.feedReadings
+
+    private val closed: Boolean get() = stopReason != null
     private val connected = AtomicBoolean(false)
     @Volatile private var worker: Handler? = null
     private var activeMode: DiLink5Platform.ActiveModeSnapshot? = null
@@ -97,7 +143,7 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
                 "all", "vehicle" -> {
                     val vehicle = if (section == "all") config.optJSONObject("vehicle") else config
                     if (!Sealion7HdmiProjection.isUserSelected(vehicle?.opt("modelId"), vehicle?.opt("modelSource"))) {
-                        close()
+                        stop("Sealion 7 no longer selected")
                     }
                 }
             }
@@ -106,42 +152,42 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
     private val thread = object : HandlerThread(TAG) {
         override fun onLooperPrepared() {
             worker = Handler(looper)
-            if (closed.get()) quitSafely() else open()
+            if (closed) {
+                quitSafely()
+            } else {
+                UnifiedConfigManager.addListener(configListener)
+                recheckSelection()
+            }
         }
     }
 
     /** Resolve speed on the render thread from the latest reading, with the normal feed as fallback. */
     fun speedKmhOr(feedSpeedKmh: Double): Double {
-        if (closed.get() || !connected.get()) return feedSpeedKmh
-        return latest.valueOr(SystemClock.elapsedRealtime(), feedSpeedKmh)
-    }
-
-    private fun readEligibleModel(mode: DiLink5Platform.ActiveModeSnapshot): Boolean = try {
-        val deadline = SystemClock.elapsedRealtime() + CONFIG_READ_BUDGET_MS
-        val vehicle = UnifiedConfigManager.readDurableConfigBefore(deadline)?.optJSONObject("vehicle")
-        eligible(mode.mode, vehicle?.opt("modelId"), vehicle?.opt("modelSource"))
-    } catch (_: Exception) {
-        false
+        return latest.valueOr(SystemClock.elapsedRealtime(), feedSpeedKmh, connected.get())
     }
 
     private fun recheckSelection() {
-        if (closed.get()) return
-        val mode = activeMode ?: return close()
-        if (!mode.matches(DiLink5Platform.currentActiveModeSnapshot()) || !readEligibleModel(mode)) return close()
-        worker?.postDelayed(checkSelection, SELECTION_CHECK_MS)
+        if (closed) return
+        val mode = DiLink5Platform.currentActiveModeSnapshot() ?: return stop("Committed mode unavailable")
+        val previous = activeMode
+        if (previous != null && !previous.matches(mode)) return stop("Committed mode changed")
+        if (!DiLink5Platform.isSelected(mode.mode, null)) return stop("DiLink 5 not selected")
+        activeMode = mode
+
+        val action = selectionAction(mode.mode, connection != null) {
+            UnifiedConfigManager.readDurableConfigBefore(SystemClock.elapsedRealtime() + CONFIG_READ_BUDGET_MS)
+        }
+        when (action) {
+            SelectionAction.STOP -> return stop("Sealion 7 no longer selected")
+            SelectionAction.OPEN_ADAPTER -> if (!closed) openAdapter()
+            SelectionAction.RECHECK -> Unit
+        }
+        if (!closed) worker?.postDelayed(checkSelection, SELECTION_CHECK_MS)
     }
 
-    private fun open() {
+    private fun openAdapter() {
         val app = checkNotNull(context)
         try {
-            // The app's cached mode may predate the daemon's committed selection.
-            val mode = DiLink5Platform.currentActiveModeSnapshot() ?: return close()
-            if (!DiLink5Platform.isSelected(mode.mode, null)) return close()
-            activeMode = mode
-            UnifiedConfigManager.addListener(configListener)
-            recheckSelection()
-            if (closed.get()) return
-
             val loader = app.classLoader
             val managerType = loader.loadClass(ADAPTER + "CarAdapterManager")
             val listenerType = loader.loadClass(ADAPTER + "interfaces.OnCarAdapterConnectListener")
@@ -168,9 +214,9 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
                 constants.getField("SENSOR_SERVICE").get(null) as String,
                 sensorType.getMethod("getSpeedValue"),
             )
-            if (closed.get()) return
+            if (closed) return
             managerType.getMethod("setOnManagerConnChangedListener", listenerType).invoke(manager, listener)
-            if (closed.get()) return
+            if (closed) return
             if (managerType.getMethod("isServiceBound").invoke(manager) == true) {
                 onConnectionChanged(true)
             } else {
@@ -184,10 +230,10 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
     }
 
     private fun onConnectionChanged(bound: Boolean) {
-        if (closed.get() || connected.getAndSet(bound) == bound) return
+        if (closed || connected.getAndSet(bound) == bound) return
         if (!bound) latest.clear()
         worker?.post {
-            if (closed.get()) return@post
+            if (closed) return@post
             worker?.removeCallbacks(poll)
             sensor = null
             if (connected.get()) pollSpeed()
@@ -195,14 +241,14 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
     }
 
     private fun pollSpeed() {
-        if (closed.get() || !connected.get()) return
+        if (closed || !connected.get()) return
         val source = connection ?: return
         val generation = latest.generation()
         val startedAt = SystemClock.elapsedRealtime()
         try {
             val adapter = sensor ?: source.getAdapter.invoke(source.manager, source.serviceKey).also { sensor = it }
             val value = (adapter?.let { source.readSpeed.invoke(it) } as? Number)?.toDouble() ?: Double.NaN
-            if (!closed.get() && connected.get()) latest.publish(value, startedAt, generation)
+            if (!closed && connected.get()) latest.publish(value, startedAt, generation)
         } catch (error: Exception) {
             val cause = (error as? InvocationTargetException)?.cause ?: error
             if (cause is SecurityException || cause is UnsupportedOperationException ||
@@ -213,17 +259,19 @@ internal class Sealion7LayoutSpeedReader private constructor(private val context
         } catch (error: LinkageError) {
             return stopOnFailure(error)
         }
-        if (!closed.get() && connected.get()) worker?.postDelayed(poll, POLL_DELAY_MS)
+        if (!closed && connected.get()) worker?.postDelayed(poll, POLL_DELAY_MS)
     }
 
     private fun stopOnFailure(error: Throwable) {
-        Log.w(TAG, "Speed adapter unavailable", (error as? InvocationTargetException)?.cause ?: error)
-        close()
+        val cause = (error as? InvocationTargetException)?.cause ?: error
+        Log.w(TAG, "Speed adapter unavailable", cause)
+        stop("Speed adapter unavailable (${cause.javaClass.simpleName})")
     }
 
-    override fun close() {
-        if (!closed.compareAndSet(false, true)) return
-        latest.clear()
+    override fun close() = stop("Session closed")
+
+    private fun stop(reason: String) {
+        if (!latest.stop(reason)) return
         worker?.post {
             worker?.removeCallbacks(poll)
             worker?.removeCallbacks(checkSelection)
